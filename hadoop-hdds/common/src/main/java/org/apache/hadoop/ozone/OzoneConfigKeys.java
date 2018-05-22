@@ -325,7 +325,6 @@ public final class OzoneConfigKeys {
 
   public static final String OZONE_CONTAINER_COPY_WORKDIR =
       "hdds.datanode.replication.work.dir";
-
   /**
    * There is no need to instantiate this class.
    */
