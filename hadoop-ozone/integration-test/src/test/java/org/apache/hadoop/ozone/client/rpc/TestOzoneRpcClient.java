@@ -18,6 +18,7 @@
 
 package org.apache.hadoop.ozone.client.rpc;
 
+import org.apache.commons.io.FileUtils;
 import org.apache.commons.lang3.RandomStringUtils;
 import org.apache.commons.lang3.RandomUtils;
 import org.apache.hadoop.hdds.protocol.StorageType;
@@ -39,9 +40,13 @@ import org.apache.hadoop.hdds.client.ReplicationType;
 import org.apache.hadoop.ozone.client.io.ChunkGroupOutputStream;
 import org.apache.hadoop.ozone.client.io.OzoneInputStream;
 import org.apache.hadoop.ozone.client.io.OzoneOutputStream;
+import org.apache.hadoop.ozone.common.OzoneChecksumException;
 import org.apache.hadoop.ozone.container.common.helpers.BlockData;
+import org.apache.hadoop.ozone.container.common.interfaces.Container;
 import org.apache.hadoop.ozone.container.keyvalue.KeyValueBlockIterator;
 import org.apache.hadoop.ozone.container.keyvalue.KeyValueContainerData;
+import org.apache.hadoop.ozone.container.keyvalue.helpers
+    .KeyValueContainerLocationUtil;
 import org.apache.hadoop.ozone.om.OzoneManager;
 import org.apache.hadoop.ozone.om.helpers.OmKeyArgs;
 import org.apache.hadoop.ozone.om.helpers.OmKeyInfo;
@@ -51,6 +56,7 @@ import org.apache.hadoop.ozone.client.rest.OzoneException;
 import org.apache.hadoop.hdds.scm.ScmConfigKeys;
 import org.apache.hadoop.hdds.scm.protocolPB.
     StorageContainerLocationProtocolClientSideTranslatorPB;
+import org.apache.hadoop.ozone.om.helpers.OmMultipartInfo;
 import org.apache.hadoop.test.GenericTestUtils;
 import org.apache.hadoop.util.Time;
 import org.junit.AfterClass;
@@ -70,6 +76,8 @@ import java.util.UUID;
 
 import static org.hamcrest.CoreMatchers.containsString;
 import static org.hamcrest.CoreMatchers.either;
+import static org.junit.Assert.assertNotEquals;
+import static org.junit.Assert.assertNotNull;
 import static org.junit.Assert.assertThat;
 
 /**
@@ -87,6 +95,8 @@ public class TestOzoneRpcClient {
   private static StorageContainerLocationProtocolClientSideTranslatorPB
       storageContainerLocationClient;
 
+  private static final String SCM_ID = UUID.randomUUID().toString();
+
   /**
    * Create a MiniOzoneCluster for testing.
    * <p>
@@ -98,7 +108,10 @@ public class TestOzoneRpcClient {
   public static void init() throws Exception {
     OzoneConfiguration conf = new OzoneConfiguration();
     conf.setInt(ScmConfigKeys.OZONE_SCM_CONTAINER_PROVISION_BATCH_SIZE, 1);
-    cluster = MiniOzoneCluster.newBuilder(conf).setNumDatanodes(10).build();
+    cluster = MiniOzoneCluster.newBuilder(conf)
+        .setNumDatanodes(10)
+        .setScmId(SCM_ID)
+        .build();
     cluster.waitForClusterToBeReady();
     ozClient = OzoneClientFactory.getRpcClient(conf);
     store = ozClient.getObjectStore();
@@ -821,6 +834,92 @@ public class TestOzoneRpcClient {
     }
   }
 
+  /**
+   * Tests reading a corrputed chunk file throws checksum exception.
+   * @throws IOException
+   */
+  @Test
+  public void testReadKeyWithCorruptedData() throws IOException {
+    String volumeName = UUID.randomUUID().toString();
+    String bucketName = UUID.randomUUID().toString();
+
+    String value = "sample value";
+    store.createVolume(volumeName);
+    OzoneVolume volume = store.getVolume(volumeName);
+    volume.createBucket(bucketName);
+    OzoneBucket bucket = volume.getBucket(bucketName);
+    String keyName = UUID.randomUUID().toString();
+
+    // Write data into a key
+    OzoneOutputStream out = bucket.createKey(keyName,
+        value.getBytes().length, ReplicationType.STAND_ALONE,
+        ReplicationFactor.ONE);
+    out.write(value.getBytes());
+    out.close();
+
+    // We need to find the location of the chunk file corresponding to the
+    // data we just wrote.
+    OzoneKey key = bucket.getKey(keyName);
+    long containerID = ((OzoneKeyDetails) key).getOzoneKeyLocations().get(0)
+        .getContainerID();
+    long localID = ((OzoneKeyDetails) key).getOzoneKeyLocations().get(0)
+        .getLocalID();
+
+    // Get the container by traversing the datanodes. Atleast one of the
+    // datanode must have this container.
+    Container container = null;
+    for (HddsDatanodeService hddsDatanode : cluster.getHddsDatanodes()) {
+      container = hddsDatanode.getDatanodeStateMachine().getContainer()
+          .getContainerSet().getContainer(containerID);
+      if (container != null) {
+        break;
+      }
+    }
+    Assert.assertNotNull("Container not found", container);
+
+    // From the containerData, get the block iterator for all the blocks in
+    // the container.
+    KeyValueContainerData containerData =
+        (KeyValueContainerData) container.getContainerData();
+    String containerPath = new File(containerData.getMetadataPath())
+        .getParent();
+    KeyValueBlockIterator keyValueBlockIterator = new KeyValueBlockIterator(
+        containerID, new File(containerPath));
+
+    // Find the block corresponding to the key we put. We use the localID of
+    // the BlockData to identify out key.
+    BlockData blockData = null;
+    while (keyValueBlockIterator.hasNext()) {
+      blockData = keyValueBlockIterator.nextBlock();
+      if (blockData.getBlockID().getLocalID() == localID) {
+        break;
+      }
+    }
+    Assert.assertNotNull("Block not found", blockData);
+
+    // Get the location of the chunk file
+    String chunkName = blockData.getChunks().get(0).getChunkName();
+    String containreBaseDir = container.getContainerData().getVolume()
+        .getHddsRootDir().getPath();
+    File chunksLocationPath = KeyValueContainerLocationUtil
+        .getChunksLocationPath(containreBaseDir, SCM_ID, containerID);
+    File chunkFile = new File(chunksLocationPath, chunkName);
+
+    // Corrupt the contents of the chunk file
+    String newData = new String("corrupted data");
+    FileUtils.writeByteArrayToFile(chunkFile, newData.getBytes());
+
+    // Try reading the key. Since the chunk file is corrupted, it should
+    // throw a checksum mismatch exception.
+    try {
+      OzoneInputStream is = bucket.readKey(keyName);
+      is.read(new byte[100]);
+      Assert.fail("Reading corrupted data should fail.");
+    } catch (OzoneChecksumException e) {
+      GenericTestUtils.assertExceptionContains("Checksum mismatch", e);
+    }
+  }
+
   @Test
   public void testDeleteKey()
       throws IOException, OzoneException {
@@ -1162,6 +1261,73 @@ public class TestOzoneRpcClient {
       Assert.fail();
     }
   }
+
+  @Test
+  public void testInitiateMultipartUploadWithReplicationInformationSet() throws
+      IOException {
+    String volumeName = UUID.randomUUID().toString();
+    String bucketName = UUID.randomUUID().toString();
+    String keyName = UUID.randomUUID().toString();
+
+    store.createVolume(volumeName);
+    OzoneVolume volume = store.getVolume(volumeName);
+    volume.createBucket(bucketName);
+    OzoneBucket bucket = volume.getBucket(bucketName);
+    OmMultipartInfo multipartInfo = bucket.initiateMultipartUpload(keyName,
+        ReplicationType.STAND_ALONE, ReplicationFactor.ONE);
+
+    assertNotNull(multipartInfo);
+    String uploadID = multipartInfo.getUploadID();
+    Assert.assertEquals(volumeName, multipartInfo.getVolumeName());
+    Assert.assertEquals(bucketName, multipartInfo.getBucketName());
+    Assert.assertEquals(keyName, multipartInfo.getKeyName());
+    assertNotNull(multipartInfo.getUploadID());
+
+    // Call initiate multipart upload for the same key again, this should
+    // generate a new uploadID.
+    multipartInfo = bucket.initiateMultipartUpload(keyName,
+        ReplicationType.STAND_ALONE, ReplicationFactor.ONE);
+
+    assertNotNull(multipartInfo);
+    Assert.assertEquals(volumeName, multipartInfo.getVolumeName());
+    Assert.assertEquals(bucketName, multipartInfo.getBucketName());
+    Assert.assertEquals(keyName, multipartInfo.getKeyName());
+    assertNotEquals(multipartInfo.getUploadID(), uploadID);
+    assertNotNull(multipartInfo.getUploadID());
+  }
+
+  @Test
+  public void testInitiateMultipartUploadWithDefaultReplication() throws
+      IOException {
+    String volumeName = UUID.randomUUID().toString();
+    String bucketName = UUID.randomUUID().toString();
+    String keyName = UUID.randomUUID().toString();
+
+    store.createVolume(volumeName);
+    OzoneVolume volume = store.getVolume(volumeName);
+    volume.createBucket(bucketName);
+    OzoneBucket bucket = volume.getBucket(bucketName);
+    OmMultipartInfo multipartInfo = bucket.initiateMultipartUpload(keyName);
+
+    assertNotNull(multipartInfo);
+    String uploadID = multipartInfo.getUploadID();
+    Assert.assertEquals(volumeName, multipartInfo.getVolumeName());
+    Assert.assertEquals(bucketName, multipartInfo.getBucketName());
+    Assert.assertEquals(keyName, multipartInfo.getKeyName());
+    assertNotNull(multipartInfo.getUploadID());
+
+    // Call initiate multipart upload for the same key again, this should
+    // generate a new uploadID.
+    multipartInfo = bucket.initiateMultipartUpload(keyName);
+
+    assertNotNull(multipartInfo);
+    Assert.assertEquals(volumeName, multipartInfo.getVolumeName());
+    Assert.assertEquals(bucketName, multipartInfo.getBucketName());
+    Assert.assertEquals(keyName, multipartInfo.getKeyName());
+    assertNotEquals(multipartInfo.getUploadID(), uploadID);
+    assertNotNull(multipartInfo.getUploadID());
+  }
+
 
   /**
    * Close OzoneClient and shutdown MiniOzoneCluster.
